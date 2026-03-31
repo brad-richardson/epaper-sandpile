@@ -4,14 +4,14 @@
 #include <Arduino.h>
 
 #ifndef DISP_W
-#define DISP_W 648
+#define DISP_W 800
 #endif
 #ifndef DISP_H
 #define DISP_H 480
 #endif
 
 // ---------------------------------------------------------------------------
-// Per-source colour assignment (shuffled each generation)
+// Per-source colour assignment (shuffled each generation, persisted in RTC)
 // ---------------------------------------------------------------------------
 static uint8_t source_color[MAX_SOURCES]; // colour index for each source
 
@@ -55,6 +55,22 @@ void renderer_init(int n, const Source *sources)
 }
 
 // ---------------------------------------------------------------------------
+void renderer_get_palette(uint8_t *out, int n)
+{
+    for (int i = 0; i < n && i < MAX_SOURCES; i++) {
+        out[i] = source_color[i];
+    }
+}
+
+// ---------------------------------------------------------------------------
+void renderer_set_palette(const uint8_t *colors, int n)
+{
+    for (int i = 0; i < n && i < MAX_SOURCES; i++) {
+        source_color[i] = colors[i];
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Render the sandpile grid into a packed 4-bit-per-pixel Spectra 6 buffer.
 //
 // Layout: pixel (x, y) at display coordinates maps back to grid coordinates
@@ -81,7 +97,7 @@ void renderer_render(uint8_t *buf, int buf_size,
             int gx = (dx * GRID_W) / DISP_W;
             if (gx >= GRID_W) gx = GRID_W - 1;
 
-            uint8_t grains = grid[gy * GRID_W + gx];
+            uint16_t grains = grid[gy * GRID_W + gx];
             uint8_t color;
 
             if (grains == 0) {

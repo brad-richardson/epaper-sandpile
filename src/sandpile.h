@@ -19,8 +19,13 @@
 // Maximum stable grain count per cell (topple fires when value >= TOPPLE_THRESHOLD)
 #define TOPPLE_THRESHOLD 4u
 
+// Maximum scan passes in sandpile_topple() before bailing out.
+// Prevents unbounded loops when drops outnumber stable-state capacity.
+#define MAX_TOPPLE_PASSES 1000u
+
 // Flat row-major grid: grid[y * GRID_W + x]
-extern uint8_t grid[GRID_W * GRID_H];
+// uint16_t prevents overflow when many grains accumulate before toppling.
+extern uint16_t grid[GRID_W * GRID_H];
 
 // Reset every cell to 0
 void sandpile_reset();

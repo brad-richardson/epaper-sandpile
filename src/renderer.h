@@ -39,6 +39,16 @@
 void renderer_init(int n, const Source *sources);
 
 // ---------------------------------------------------------------------------
+// Copy the current source→colour assignment into `out` (length n).
+// Call after renderer_init() to save the palette to RTC for later restore.
+void renderer_get_palette(uint8_t *out, int n);
+
+// ---------------------------------------------------------------------------
+// Restore a previously saved source→colour assignment without reshuffling.
+// Call instead of renderer_init() when waking from deep sleep.
+void renderer_set_palette(const uint8_t *colors, int n);
+
+// ---------------------------------------------------------------------------
 // Build the packed Spectra 6 framebuffer from the current grid and Voronoi
 // owner map.  Scales the 120×120 grid to DISP_W×DISP_H using nearest-neighbour.
 //
