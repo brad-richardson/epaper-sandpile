@@ -69,18 +69,29 @@ RTC_DATA_ATTR static uint8_t  rtc_grid_packed[RTC_GRID_PACKED_SIZE];
 
 // ---------------------------------------------------------------------------
 // Pack / unpack the grid into 2-bit-per-cell RTC storage.
-// After toppling, all cell values are in [0, 3]; values >= 4 are clamped.
+// After toppling, all cell values are in [0, 3]; values >= 4 are clamped
+// (this can only happen if sandpile_topple() hit MAX_TOPPLE_PASSES).
 // ---------------------------------------------------------------------------
 static void grid_pack()
 {
+    bool clamped = false;
     for (int i = 0; i < GRID_W * GRID_H; i++) {
-        uint8_t v = (grid[i] < 4) ? (uint8_t)grid[i] : 3;
+        uint8_t v;
+        if (grid[i] < 4) {
+            v = (uint8_t)grid[i];
+        } else {
+            v = 3;
+            clamped = true;
+        }
         int byte_idx = i / 4;
         int shift    = (i % 4) * 2;
         if (shift == 0)
             rtc_grid_packed[byte_idx] = v;
         else
             rtc_grid_packed[byte_idx] |= (v << shift);
+    }
+    if (clamped) {
+        Serial.println("[pack] WARN: grid not fully stable, clamped cells >= 4");
     }
 }
 
