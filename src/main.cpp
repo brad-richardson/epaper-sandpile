@@ -35,7 +35,6 @@ static uint8_t framebuf[FRAMEBUF_SIZE];
 #ifdef SIM_GOL
 
 #include "gol.h"
-#include "renderer_bw.h"
 
 // ---------------------------------------------------------------------------
 // RTC memory for GoL
@@ -94,20 +93,17 @@ static bool gol_is_stale()
 
 static void gol_push_display()
 {
-    renderer_bw_render(framebuf, (int)FRAMEBUF_SIZE);
-
 #ifdef EPAPER_ENABLE
     if (epaper) {
+        // Render directly to sprite — skip intermediate framebuffer
+        epaper->fillSprite(TFT_WHITE);
         for (int dy = 0; dy < DISP_H; dy++) {
+            int gy = (dy * GOL_H) / DISP_H;
             for (int dx = 0; dx < DISP_W; dx++) {
-                int byte_idx = (dy * DISP_W + dx) / 2;
-                uint8_t nibble;
-                if ((dx & 1) == 0) {
-                    nibble = (framebuf[byte_idx] >> 4) & 0x0F;
-                } else {
-                    nibble = framebuf[byte_idx] & 0x0F;
+                int gx = (dx * GOL_W) / DISP_W;
+                if (gol_get(gol_grid, gx, gy)) {
+                    epaper->drawPixel(dx, dy, TFT_BLACK);
                 }
-                epaper->drawPixel(dx, dy, nibble == BW_BLACK ? TFT_BLACK : TFT_WHITE);
             }
         }
         epaper->update();
@@ -125,7 +121,6 @@ static void gol_push_display()
 void setup()
 {
     Serial0.begin(115200);
-    delay(500);
     Serial0.println("[boot] Game of Life starting...");
 
 #ifdef EPAPER_ENABLE
@@ -344,7 +339,6 @@ static void push_display()
 void setup()
 {
     Serial0.begin(115200);
-    delay(500);
     Serial0.println("[boot] Sandpile starting...");
 
 #ifdef EPAPER_ENABLE
