@@ -1,5 +1,4 @@
 #include <Arduino.h>
-#include <Preferences.h>
 #include <esp_sleep.h>
 #include <esp_random.h>
 
@@ -35,9 +34,14 @@ static uint8_t framebuf[FRAMEBUF_SIZE];
 #endif
 
 // ---------------------------------------------------------------------------
-// RTC memory — survives deep sleep.  Holds lightweight metadata only; the
-// full grid (28.8 KB for uint16_t) is stored in NVS flash between wakes.
+// RTC memory — survives deep sleep.
+//
+// The full grid (uint16_t, 28.8 KB) is too large for RTC, but after toppling
+// every cell is in [0, 3], so we pack 4 cells per byte (2 bits each).
+// 120×120 / 4 = 3600 bytes — fits comfortably in ESP32-S3 RTC slow memory.
 // ---------------------------------------------------------------------------
+#define RTC_GRID_PACKED_SIZE ((GRID_W * GRID_H + 3) / 4)
+
 RTC_DATA_ATTR static uint32_t rtc_seed      = 0;  // persistent RNG seed
 RTC_DATA_ATTR static uint32_t rtc_frame     = 0;  // frames rendered this generation
 RTC_DATA_ATTR static int      rtc_n_sources = 0;
@@ -47,12 +51,7 @@ RTC_DATA_ATTR static int      rtc_uf_rank[MAX_SOURCES];
 // Palette persisted so colours are stable across every deep-sleep/wake cycle
 RTC_DATA_ATTR static uint8_t  rtc_source_color[MAX_SOURCES];
 RTC_DATA_ATTR static bool     rtc_valid = false; // set true once first frame is done
-
-// ---------------------------------------------------------------------------
-// NVS keys used to persist the sandpile grid across deep sleep cycles
-// ---------------------------------------------------------------------------
-static const char NVS_NS[]   = "sandpile";
-static const char NVS_GRID[] = "grid";
+RTC_DATA_ATTR static uint8_t  rtc_grid_packed[RTC_GRID_PACKED_SIZE];
 
 // ---------------------------------------------------------------------------
 // Lifecycle tunables
@@ -63,9 +62,47 @@ static const char NVS_GRID[] = "grid";
 #define NUM_SOURCES_MIN     1
 #define NUM_SOURCES_MAX     8
 #define CIRCLE_RADIUS_FRAC  0.35f         // source circle radius as fraction of min(W,H)
-// Write the grid to NVS only every N frames to limit flash wear.
-// At one frame per 30 s: N=10 -> ~288 writes/day -> flash endurance ~350 days.
-#define NVS_WRITE_INTERVAL  10
+// Start a new generation after this many frames (~100 min at 30 s/frame).
+// Acts as a ceiling alongside the fill threshold so the display always
+// cycles through different source configurations eventually.
+#define MAX_FRAMES_PER_GENERATION 200
+
+// ---------------------------------------------------------------------------
+// Pack / unpack the grid into 2-bit-per-cell RTC storage.
+// After toppling, all cell values are in [0, 3]; values >= 4 are clamped
+// (this can only happen if sandpile_topple() hit MAX_TOPPLE_PASSES).
+// ---------------------------------------------------------------------------
+static void grid_pack()
+{
+    bool clamped = false;
+    for (int i = 0; i < GRID_W * GRID_H; i++) {
+        uint8_t v;
+        if (grid[i] < 4) {
+            v = (uint8_t)grid[i];
+        } else {
+            v = 3;
+            clamped = true;
+        }
+        int byte_idx = i / 4;
+        int shift    = (i % 4) * 2;
+        if (shift == 0)
+            rtc_grid_packed[byte_idx] = v;
+        else
+            rtc_grid_packed[byte_idx] |= (v << shift);
+    }
+    if (clamped) {
+        Serial.println("[pack] WARN: grid not fully stable, clamped cells >= 4");
+    }
+}
+
+static void grid_unpack()
+{
+    for (int i = 0; i < GRID_W * GRID_H; i++) {
+        int byte_idx = i / 4;
+        int shift    = (i % 4) * 2;
+        grid[i] = (rtc_grid_packed[byte_idx] >> shift) & 0x03;
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Active generation state (mirrors the RTC copies for in-loop convenience)
@@ -74,52 +111,6 @@ static Source sources[MAX_SOURCES];
 static int    n_sources = 0;
 static int    uf_parent[MAX_SOURCES];
 static int    uf_rank[MAX_SOURCES];
-
-// ---------------------------------------------------------------------------
-// Persist the grid to NVS flash so it survives deep sleep
-// ---------------------------------------------------------------------------
-static void grid_save()
-{
-    Preferences prefs;
-    if (!prefs.begin(NVS_NS, /*readOnly=*/false)) {
-        Serial.println("[nvs] ERROR: could not open NVS namespace for writing");
-        return;
-    }
-    size_t written = prefs.putBytes(NVS_GRID, grid, sizeof(grid));
-    if (written != sizeof(grid)) {
-        Serial.printf("[nvs] ERROR: wrote %u of %u bytes\n",
-                      (unsigned)written, (unsigned)sizeof(grid));
-    }
-    prefs.end();
-}
-
-// ---------------------------------------------------------------------------
-// Restore the grid from NVS flash.  Returns true if a valid grid was found.
-// ---------------------------------------------------------------------------
-static bool grid_restore()
-{
-    Preferences prefs;
-    if (!prefs.begin(NVS_NS, /*readOnly=*/true)) {
-        Serial.println("[nvs] ERROR: could not open NVS namespace for reading");
-        return false;
-    }
-    size_t stored = prefs.getBytesLength(NVS_GRID);
-    bool ok = (stored == sizeof(grid));
-    if (ok) {
-        size_t read = prefs.getBytes(NVS_GRID, grid, sizeof(grid));
-        ok = (read == sizeof(grid));
-        if (!ok) {
-            Serial.printf("[nvs] ERROR: read %u of %u bytes\n",
-                          (unsigned)read, (unsigned)sizeof(grid));
-        }
-    } else if (stored != 0) {
-        // Stale entry (e.g. grid type changed); size mismatch
-        Serial.printf("[nvs] WARN: stored grid size %u != expected %u -- ignoring\n",
-                      (unsigned)stored, (unsigned)sizeof(grid));
-    }
-    prefs.end();
-    return ok;
-}
 
 // ---------------------------------------------------------------------------
 // Start a brand-new generation: new sources, palette, Voronoi map, clear grid
@@ -235,12 +226,9 @@ void setup()
     randomSeed(rtc_seed + rtc_frame);
 
     if (rtc_valid) {
-        // Waking from deep sleep -- restore simulation state
+        // Waking from deep sleep -- restore generation metadata and grid
         generation_restore();
-        if (!grid_restore()) {
-            // NVS read failed or size mismatch -- reset to a clean state
-            sandpile_reset();
-        }
+        grid_unpack();
     } else {
         // True first boot -- start fresh
         new_generation();
@@ -250,9 +238,10 @@ void setup()
 
 void loop()
 {
-    // Check fill threshold -> start a new generation if the grid is saturated
-    if (sandpile_fill_percent() > FILL_THRESHOLD) {
-        Serial.println("[lifecycle] fill threshold reached -- new generation");
+    // Start a new generation if the grid is saturated or we've been running long enough
+    if (rtc_frame >= MAX_FRAMES_PER_GENERATION
+            || sandpile_fill_percent() > FILL_THRESHOLD) {
+        Serial.println("[lifecycle] generation reset triggered");
         // XOR-mix the existing seed with fresh hardware entropy so each
         // generation starts from a visually distinct random state.
         rtc_seed ^= esp_random();
@@ -276,10 +265,8 @@ void loop()
     push_display();
     rtc_frame++;
 
-    // 5. Write grid to NVS every NVS_WRITE_INTERVAL frames to limit flash wear
-    if (rtc_frame % NVS_WRITE_INTERVAL == 0) {
-        grid_save();
-    }
+    // 5. Pack grid into RTC memory so it survives deep sleep (3600 bytes)
+    grid_pack();
 
     // 6. Deep sleep until the next refresh cycle.
     //    The ePaper display holds its image with zero power draw during sleep.
